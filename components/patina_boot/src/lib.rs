@@ -38,4 +38,5 @@ pub mod orchestrators;
 
 pub use boot_dispatcher::BootDispatcher;
 pub use boot_orchestrator::BootOrchestrator;
+pub use helpers::DxeServices;
 pub use orchestrators::SimpleBootManager;

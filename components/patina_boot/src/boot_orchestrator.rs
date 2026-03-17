@@ -14,6 +14,8 @@
 use patina::{boot_services::StandardBootServices, error::EfiError, runtime_services::StandardRuntimeServices};
 use r_efi::efi;
 
+use crate::helpers::DxeServices;
+
 /// Trait for boot orchestration.
 ///
 /// Platforms implement this trait to define custom boot flows. The implementation
@@ -38,6 +40,7 @@ use r_efi::efi;
 ///         &self,
 ///         boot_services: &StandardBootServices,
 ///         runtime_services: &StandardRuntimeServices,
+///         dxe_services: &dyn DxeServices,
 ///         image_handle: efi::Handle,
 ///     ) -> Result<!, EfiError> {
 ///         // Custom boot flow...
@@ -52,7 +55,7 @@ pub trait BootOrchestrator: Send + Sync + 'static {
     /// Called by [`BootDispatcher`](crate::BootDispatcher) when the DXE core invokes
     /// the BDS architectural protocol. This method should:
     ///
-    /// 1. Enumerate devices (e.g., `connect_all()`)
+    /// 1. Enumerate devices (e.g., `interleave_connect_and_dispatch()`)
     /// 2. Signal BDS phase events (EndOfDxe, ReadyToBoot)
     /// 3. Attempt to boot from configured device paths
     /// 4. Handle boot failures
@@ -65,6 +68,7 @@ pub trait BootOrchestrator: Send + Sync + 'static {
         &self,
         boot_services: &StandardBootServices,
         runtime_services: &StandardRuntimeServices,
+        dxe_services: &dyn DxeServices,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError>;
 }

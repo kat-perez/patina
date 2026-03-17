@@ -23,7 +23,7 @@ use patina::{
 };
 use r_efi::efi;
 
-use crate::{boot_orchestrator::BootOrchestrator, config::BootConfig, helpers};
+use crate::{boot_orchestrator::BootOrchestrator, config::BootConfig, helpers, helpers::DxeServices};
 
 /// Simple boot manager implementing [`BootOrchestrator`].
 ///
@@ -32,7 +32,7 @@ use crate::{boot_orchestrator::BootOrchestrator, config::BootConfig, helpers};
 ///
 /// ## Boot Flow
 ///
-/// 1. Connect all controllers for device enumeration
+/// 1. Interleave controller connection with DXE driver dispatch for device enumeration
 /// 2. Signal EndOfDxe (security lockdown)
 /// 3. Discover console devices
 /// 4. Detect hotkey (if configured); select alternate devices if pressed
@@ -78,10 +78,11 @@ impl BootOrchestrator for SimpleBootManager {
         &self,
         boot_services: &StandardBootServices,
         runtime_services: &StandardRuntimeServices,
+        dxe_services: &dyn DxeServices,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
-        if let Err(e) = helpers::connect_all(boot_services) {
-            log::error!("connect_all failed: {:?}", e);
+        if let Err(e) = helpers::interleave_connect_and_dispatch(boot_services, dxe_services) {
+            log::error!("interleave_connect_and_dispatch failed: {:?}", e);
         }
 
         if let Err(e) = helpers::signal_bds_phase_entry(boot_services) {

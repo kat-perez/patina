@@ -24,11 +24,12 @@ use patina::{
 };
 use spin::Once;
 
-use crate::boot_orchestrator::BootOrchestrator;
+use crate::{boot_orchestrator::BootOrchestrator, helpers::DxeServices};
 
 /// Context stored in a static for the BDS protocol callback to access.
 struct BdsContext {
     orchestrator: Box<dyn BootOrchestrator>,
+    dxe_services: Box<dyn DxeServices>,
     boot_services: StandardBootServices,
     runtime_services: StandardRuntimeServices,
     image_handle: r_efi::efi::Handle,
@@ -51,32 +52,18 @@ static BDS_CONTEXT: Once<BdsContext> = Once::new();
 /// - Accepts a [`BootOrchestrator`] implementation via [`BootDispatcher::new()`]
 /// - Installs the BDS architectural protocol during component dispatch
 /// - When the DXE core invokes BDS: delegates to `orchestrator.execute()`
-///
-/// ## Usage
-///
-/// ```rust,ignore
-/// use patina_boot::{BootDispatcher, SimpleBootManager, config::BootConfig};
-///
-/// // Minimal boot:
-/// add.component(BootDispatcher::new(SimpleBootManager::new(
-///     BootConfig::new(nvme_esp_path())
-///         .with_device(nvme_recovery_path()),
-/// )));
-///
-/// // Custom orchestrator:
-/// add.component(BootDispatcher::new(MyCustomOrchestrator::new()));
-/// ```
 pub struct BootDispatcher {
     orchestrator: Box<dyn BootOrchestrator>,
+    dxe_services: Box<dyn DxeServices>,
 }
 
 impl BootDispatcher {
-    /// Create a new `BootDispatcher` with the given orchestrator.
+    /// Create a new `BootDispatcher` with the given orchestrator and DXE services.
     ///
-    /// The orchestrator is boxed internally — callers pass any type that
-    /// implements [`BootOrchestrator`].
-    pub fn new(orchestrator: impl BootOrchestrator) -> Self {
-        Self { orchestrator: Box::new(orchestrator) }
+    /// The orchestrator and DXE services are boxed internally — callers pass
+    /// any types that implement [`BootOrchestrator`] and [`DxeServices`].
+    pub fn new(orchestrator: impl BootOrchestrator, dxe_services: impl DxeServices + Send + Sync + 'static) -> Self {
+        Self { orchestrator: Box::new(orchestrator), dxe_services: Box::new(dxe_services) }
     }
 }
 
@@ -102,6 +89,7 @@ impl BootDispatcher {
         // Store the orchestrator and services for the BDS callback
         BDS_CONTEXT.call_once(|| BdsContext {
             orchestrator: self.orchestrator,
+            dxe_services: self.dxe_services,
             boot_services: boot_services.clone(),
             runtime_services: runtime_services.clone(),
             image_handle: *handle,
@@ -136,14 +124,19 @@ extern "efiapi" fn bds_entry_point(_this: *mut bds::Protocol) {
         panic!("BDS context not initialized — BootDispatcher entry_point was not called");
     };
 
-    let Err(e) = context.orchestrator.execute(&context.boot_services, &context.runtime_services, context.image_handle);
+    let Err(e) = context.orchestrator.execute(
+        &context.boot_services,
+        &context.runtime_services,
+        context.dxe_services.as_ref(),
+        context.image_handle,
+    );
     panic!("BootOrchestrator::execute() failed: {e:?}");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use patina::{boot_services::StandardBootServices, runtime_services::StandardRuntimeServices};
+    use patina::{boot_services::StandardBootServices, error::Result, runtime_services::StandardRuntimeServices};
     use r_efi::efi;
 
     struct MockOrchestrator;
@@ -153,14 +146,23 @@ mod tests {
             &self,
             _boot_services: &StandardBootServices,
             _runtime_services: &StandardRuntimeServices,
+            _dxe_services: &dyn DxeServices,
             _image_handle: efi::Handle,
         ) -> core::result::Result<!, patina::error::EfiError> {
             Err(patina::error::EfiError::NotFound)
         }
     }
 
+    struct MockDxe;
+
+    impl DxeServices for MockDxe {
+        fn dispatch(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     #[test]
     fn test_new_boot_dispatcher() {
-        let _dispatcher = BootDispatcher::new(MockOrchestrator);
+        let _dispatcher = BootDispatcher::new(MockOrchestrator, MockDxe);
     }
 }

@@ -31,6 +31,12 @@ use r_efi::{
     system::{EVENT_GROUP_READY_TO_BOOT, VARIABLE_BOOTSERVICE_ACCESS, VARIABLE_NON_VOLATILE, VARIABLE_RUNTIME_ACCESS},
 };
 
+/// Interface for dispatching DXE drivers.
+pub trait DxeServices {
+    /// Run a single dispatch pass. Returns `true` if any drivers were dispatched.
+    fn dispatch(&self) -> Result<bool>;
+}
+
 /// Watchdog timeout in seconds per UEFI Specification Section 3.1.2.
 const WATCHDOG_TIMEOUT_SECONDS: usize = 300; // 5 minutes
 
@@ -195,6 +201,49 @@ pub fn connect_all<B: BootServices>(boot_services: &B) -> Result<()> {
         }
 
         prev_handle_count = current_handle_count;
+    }
+
+    Ok(())
+}
+
+/// Interleave controller connection with DXE driver dispatch.
+///
+/// Alternates between connecting all controllers and dispatching newly loaded
+/// drivers (e.g., PCI option ROMs) until both the device topology stabilizes
+/// and no new drivers are dispatched.
+///
+/// This ensures that drivers loaded from firmware volumes during device
+/// enumeration (such as PCI option ROM drivers) are dispatched before
+/// continuing enumeration, allowing those drivers to bind to newly
+/// discovered controllers.
+///
+/// # Arguments
+///
+/// * `boot_services` - Boot services interface for controller connection
+/// * `dxe_services` - DXE services interface for driver dispatch
+///
+/// # Returns
+///
+/// Returns `Ok(())` when device enumeration is complete and no more drivers
+/// need dispatching.
+///
+pub fn interleave_connect_and_dispatch<B: BootServices, D: DxeServices + ?Sized>(
+    boot_services: &B,
+    dxe_services: &D,
+) -> Result<()> {
+    // Safety bound: if connect and dispatch haven't converged after this many
+    // rounds, something is wrong (e.g., a driver producing infinite new
+    // firmware volumes). Log and continue booting with what we have.
+    const MAX_ROUNDS: usize = 10;
+
+    for round in 0..MAX_ROUNDS {
+        connect_all(boot_services)?;
+        if !dxe_services.dispatch()? {
+            break;
+        }
+        if round == MAX_ROUNDS - 1 {
+            log::warn!("connect-dispatch interleaving did not converge after {MAX_ROUNDS} rounds");
+        }
     }
 
     Ok(())
@@ -993,6 +1042,101 @@ mod tests {
         assert!(result.is_ok());
         // 3 iterations: 1 handle, 2 handles, 2 handles (stabilized)
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    // Tests for interleave_connect_and_dispatch
+
+    /// Simple mock for [`DxeServices`] that returns a sequence of dispatch results.
+    struct MockDxeDispatcher {
+        results: std::sync::Mutex<alloc::collections::VecDeque<Result<bool>>>,
+    }
+
+    impl MockDxeDispatcher {
+        fn new(results: &[Result<bool>]) -> Self {
+            Self { results: std::sync::Mutex::new(results.iter().cloned().collect()) }
+        }
+    }
+
+    impl DxeServices for MockDxeDispatcher {
+        fn dispatch(&self) -> Result<bool> {
+            self.results.lock().unwrap().pop_front().expect("MockDxeDispatcher: unexpected dispatch call")
+        }
+    }
+
+    #[test]
+    fn test_interleave_single_round_no_drivers_dispatched() {
+        let box_mock = leaked_boot_services_for_box();
+        let mut boot_mock = MockBootServices::new();
+
+        // connect_all: immediately stable (1 handle → 1 handle)
+        boot_mock.expect_locate_handle_buffer().returning(move |_| Ok(mock_handle_buffer(&[1], box_mock)));
+        boot_mock.expect_connect_controller().returning(|_, _, _, _| Ok(()));
+
+        // No drivers to dispatch on first pass
+        let dxe_mock = MockDxeDispatcher::new(&[Ok(false)]);
+
+        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_interleave_multiple_rounds() {
+        let box_mock = leaked_boot_services_for_box();
+        let mut boot_mock = MockBootServices::new();
+
+        // connect_all: always stable (single handle)
+        boot_mock.expect_locate_handle_buffer().returning(move |_| Ok(mock_handle_buffer(&[1], box_mock)));
+        boot_mock.expect_connect_controller().returning(|_, _, _, _| Ok(()));
+
+        // First dispatch returns true (new driver dispatched), second returns false (done)
+        let dxe_mock = MockDxeDispatcher::new(&[Ok(true), Ok(false)]);
+
+        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_interleave_connect_failure_propagates() {
+        let mut boot_mock = MockBootServices::new();
+
+        // connect_all fails immediately
+        boot_mock.expect_locate_handle_buffer().returning(|_| Err(efi::Status::NOT_FOUND));
+
+        let dxe_mock = MockDxeDispatcher::new(&[]);
+
+        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interleave_dispatch_failure_propagates() {
+        let box_mock = leaked_boot_services_for_box();
+        let mut boot_mock = MockBootServices::new();
+
+        // connect_all succeeds
+        boot_mock.expect_locate_handle_buffer().returning(move |_| Ok(mock_handle_buffer(&[1], box_mock)));
+        boot_mock.expect_connect_controller().returning(|_, _, _, _| Ok(()));
+
+        // dispatch fails
+        let dxe_mock = MockDxeDispatcher::new(&[Err(EfiError::DeviceError)]);
+
+        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interleave_stops_at_max_rounds() {
+        let box_mock = leaked_boot_services_for_box();
+        let mut boot_mock = MockBootServices::new();
+
+        boot_mock.expect_locate_handle_buffer().returning(move |_| Ok(mock_handle_buffer(&[1], box_mock)));
+        boot_mock.expect_connect_controller().returning(|_, _, _, _| Ok(()));
+
+        // Dispatch always returns true (never converges) — should still terminate
+        let dxe_mock = MockDxeDispatcher::new(&[Ok(true); 10]);
+
+        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        assert!(result.is_ok());
     }
 
     // Tests for detect_hotkey_from_handles
