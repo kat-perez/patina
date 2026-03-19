@@ -363,6 +363,15 @@ impl<P: PlatformInfo> Core<P> {
         }
     }
 
+    /// Performs a single DXE driver dispatch pass.
+    ///
+    /// Returns `true` if any drivers were dispatched, `false` if no drivers remain.
+    /// This is intended for use by boot orchestrators that need to interleave
+    /// controller connection with driver dispatch.
+    pub fn dispatch(&'static self) -> Result<bool> {
+        self.pi_dispatcher.dispatch()
+    }
+
     /// The entry point for the Patina DXE Core.
     pub fn entry_point(&'static self, physical_hob_list: *const c_void) -> ! {
         if !self.set_instance() {
