@@ -15,38 +15,40 @@
 //!
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use patina::{
-    boot_services::StandardBootServices, device_path::paths::DevicePathBuf, error::EfiError,
+    boot_services::{BootServices, StandardBootServices},
+    device_path::paths::DevicePathBuf,
+    error::EfiError,
     runtime_services::StandardRuntimeServices,
 };
 use r_efi::efi;
 
 use patina::component::service::dxe_dispatch::DxeDispatch;
 
-use patina::boot_services::BootServices;
-
-use crate::{boot_orchestrator::BootOrchestrator, config::BootConfig, helpers};
+use crate::{
+    boot_orchestrator::BootOrchestrator, config::BootConfig, connect_controller::ConnectController, helpers,
+    strategies::ConnectAllStrategy,
+};
 
 /// Interleave controller connection with DXE driver dispatch.
 ///
-/// Alternates between connecting all controllers and dispatching newly loaded
-/// drivers (e.g., PCI option ROMs) until both the device topology stabilizes
-/// and no new drivers are dispatched.
+/// Alternates between the given connect function and dispatching newly loaded
+/// drivers (e.g., PCI option ROM drivers) until both the device topology
+/// stabilizes and no new drivers are dispatched.
 ///
-/// This ensures that drivers loaded from firmware volumes during device
-/// enumeration (such as PCI option ROM drivers) are dispatched before
-/// continuing enumeration, allowing those drivers to bind to newly
-/// discovered controllers.
-fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
+/// This is generic over the boot services type to support both
+/// `StandardBootServices` (production) and `MockBootServices` (testing).
+pub(crate) fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
+    connect_fn: impl Fn(&B) -> patina::error::Result<()>,
     boot_services: &B,
     dxe_services: &D,
 ) -> patina::error::Result<()> {
     const MAX_ROUNDS: usize = 10;
 
     for _round in 0..MAX_ROUNDS {
-        helpers::connect_all(boot_services)?;
+        connect_fn(boot_services)?;
         if !dxe_services.dispatch()? {
             return Ok(());
         }
@@ -73,10 +75,15 @@ fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
 /// 7. Call failure handler if all options exhausted
 pub struct SimpleBootManager {
     config: BootConfig,
+    connect_strategy: Box<dyn ConnectController>,
 }
 
 impl SimpleBootManager {
     /// Create a `SimpleBootManager` from a boot configuration.
+    ///
+    /// Uses [`ConnectAllStrategy`] by default. To customize which controllers
+    /// are connected during device enumeration, use
+    /// [`with_connect_strategy()`](Self::with_connect_strategy).
     ///
     /// ## Example
     ///
@@ -92,7 +99,26 @@ impl SimpleBootManager {
     /// );
     /// ```
     pub fn new(config: BootConfig) -> Self {
-        Self { config }
+        Self { config, connect_strategy: Box::new(ConnectAllStrategy) }
+    }
+
+    /// Create a `SimpleBootManager` with a custom connection strategy.
+    ///
+    /// The strategy controls which controllers are connected during device
+    /// enumeration in [`interleave_connect_and_dispatch()`](helpers::interleave_connect_and_dispatch).
+    ///
+    /// ## Example
+    ///
+    /// ```rust,ignore
+    /// use patina_boot::{SimpleBootManager, config::BootConfig};
+    ///
+    /// let manager = SimpleBootManager::with_connect_strategy(
+    ///     BootConfig::new(nvme_esp_path()),
+    ///     PciOnlyStrategy,
+    /// );
+    /// ```
+    pub fn with_connect_strategy(config: BootConfig, strategy: impl ConnectController) -> Self {
+        Self { config, connect_strategy: Box::new(strategy) }
     }
 }
 
@@ -113,7 +139,9 @@ impl BootOrchestrator for SimpleBootManager {
         dxe_dispatch: &dyn DxeDispatch,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
-        if let Err(e) = interleave_connect_and_dispatch(boot_services, dxe_dispatch) {
+        if let Err(e) =
+            interleave_connect_and_dispatch(|bs| self.connect_strategy.connect(bs), boot_services, dxe_dispatch)
+        {
             log::error!("interleave_connect_and_dispatch failed: {:?}", e);
         }
 
@@ -222,7 +250,7 @@ mod tests {
 
         let dxe_mock = MockDxeDispatcher::new(&[Ok(false)]);
 
-        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        let result = interleave_connect_and_dispatch(helpers::connect_all, &boot_mock, &dxe_mock);
         assert!(result.is_ok());
     }
 
@@ -236,7 +264,7 @@ mod tests {
 
         let dxe_mock = MockDxeDispatcher::new(&[Ok(true), Ok(false)]);
 
-        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        let result = interleave_connect_and_dispatch(helpers::connect_all, &boot_mock, &dxe_mock);
         assert!(result.is_ok());
     }
 
@@ -248,7 +276,7 @@ mod tests {
 
         let dxe_mock = MockDxeDispatcher::new(&[]);
 
-        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        let result = interleave_connect_and_dispatch(helpers::connect_all, &boot_mock, &dxe_mock);
         assert!(result.is_err());
     }
 
@@ -262,7 +290,7 @@ mod tests {
 
         let dxe_mock = MockDxeDispatcher::new(&[Err(EfiError::DeviceError)]);
 
-        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        let result = interleave_connect_and_dispatch(helpers::connect_all, &boot_mock, &dxe_mock);
         assert!(result.is_err());
     }
 
@@ -276,8 +304,54 @@ mod tests {
 
         let dxe_mock = MockDxeDispatcher::new(&[Ok(true); 10]);
 
-        let result = interleave_connect_and_dispatch(&boot_mock, &dxe_mock);
+        let result = interleave_connect_and_dispatch(helpers::connect_all, &boot_mock, &dxe_mock);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_interleave_custom_connect_fn_failure() {
+        let boot_mock = MockBootServices::new();
+        let dxe_mock = MockDxeDispatcher::new(&[]);
+
+        let result =
+            interleave_connect_and_dispatch(|_bs: &MockBootServices| Err(EfiError::DeviceError), &boot_mock, &dxe_mock);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interleave_custom_connect_fn_success() {
+        let boot_mock = MockBootServices::new();
+        let dxe_mock = MockDxeDispatcher::new(&[Ok(false)]);
+
+        let result = interleave_connect_and_dispatch(|_bs: &MockBootServices| Ok(()), &boot_mock, &dxe_mock);
+        assert!(result.is_ok());
+    }
+
+    // Tests for ConnectController and with_connect_strategy
+
+    struct MockConnectController;
+
+    impl ConnectController for MockConnectController {
+        #[coverage(off)]
+        fn connect(&self, _boot_services: &patina::boot_services::StandardBootServices) -> patina::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_with_connect_strategy() {
+        let config = BootConfig::new(test_device_path());
+        let strategy = ConnectAllStrategy;
+        let manager = SimpleBootManager::with_connect_strategy(config, strategy);
+        assert_eq!(manager.config().devices().count(), 1);
+    }
+
+    #[test]
+    fn test_with_custom_connect_strategy() {
+        let config = BootConfig::new(test_device_path()).with_hotkey(0x16);
+        let strategy = MockConnectController;
+        let manager = SimpleBootManager::with_connect_strategy(config, strategy);
+        assert_eq!(manager.config().hotkey(), Some(0x16));
     }
 
     #[test]
