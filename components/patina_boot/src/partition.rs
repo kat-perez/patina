@@ -13,7 +13,7 @@
 use core::ptr;
 
 use patina::{
-    boot_services::BootServices,
+    boot_services::{BootServices, protocol_handler::HandleSearchType},
     device_path::paths::DevicePathBuf,
     error::{EfiError, Result},
 };
@@ -101,6 +101,41 @@ unsafe fn lock_partition_write_inner(protocol: *mut nvme_pass_thru::Protocol) ->
     if status_field != 0 {
         log::error!("NVMe Set Features BPWPS rejected: status field {:#x}", status_field);
         return Err(EfiError::from(efi::Status::DEVICE_ERROR));
+    }
+
+    Ok(())
+}
+
+/// Write-protect every NVMe controller's boot partitions until the next power cycle.
+///
+/// Locates all handles publishing `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL` and applies the same
+/// BPWPS lock as `lock_partition_write` on each. Use this when the boot orchestrator knows
+/// the platform boots from NVMe but doesn't have a specific device path to target.
+///
+/// Per-controller failures are logged and the next controller is attempted. Returns `Ok(())`
+/// if at least one controller was reached (even if its lock attempt errored), or `Err` if no
+/// NVMe Pass-Thru protocol is published.
+pub fn lock_nvme_boot_partitions<B: BootServices>(boot_services: &B) -> Result<()> {
+    let handles = boot_services
+        .locate_handle_buffer(HandleSearchType::ByProtocol(&nvme_pass_thru::PROTOCOL_GUID))
+        .map_err(EfiError::from)?;
+
+    for &handle in handles.iter() {
+        // SAFETY: handle was returned by locate_handle_buffer for the NVMe Pass-Thru GUID.
+        let protocol = match unsafe {
+            boot_services.handle_protocol_unchecked(handle, &nvme_pass_thru::PROTOCOL_GUID)
+        } {
+            Ok(ptr) => ptr as *mut nvme_pass_thru::Protocol,
+            Err(status) => {
+                log::warn!("handle_protocol on NVMe controller {:p} failed: {:?}", handle, status);
+                continue;
+            }
+        };
+
+        // SAFETY: protocol is non-null and points to a Protocol owned by the controller.
+        if let Err(e) = unsafe { lock_partition_write_inner(protocol) } {
+            log::warn!("BPWPS lock on NVMe controller {:p} failed: {:?}", handle, e);
+        }
     }
 
     Ok(())

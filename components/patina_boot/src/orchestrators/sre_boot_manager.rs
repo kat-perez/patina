@@ -57,15 +57,16 @@ fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
 /// and capsule-update pre-boot hook will land in subsequent issues and extend this
 /// orchestrator without changing the public constructor surface.
 pub struct SreBootManager {
-    boot_partition_path: DevicePathBuf,
     main_os_path: DevicePathBuf,
 }
 
 impl SreBootManager {
-    /// Construct an `SreBootManager` from the device paths of the boot partition
-    /// (to be write-locked before OS hand-off) and the main OS boot device.
-    pub fn new(boot_partition_path: DevicePathBuf, main_os_path: DevicePathBuf) -> Self {
-        Self { boot_partition_path, main_os_path }
+    /// Construct an `SreBootManager` from the device path of the main OS boot device.
+    ///
+    /// The boot partition is discovered at runtime via `LocateProtocol` for
+    /// `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`, so no boot-partition device path is required.
+    pub fn new(main_os_path: DevicePathBuf) -> Self {
+        Self { main_os_path }
     }
 }
 
@@ -90,8 +91,8 @@ impl BootOrchestrator for SreBootManager {
             log::error!("discover_console_devices failed: {:?}", e);
         }
 
-        if let Err(e) = crate::partition::lock_partition_write(boot_services, &self.boot_partition_path) {
-            log::error!("lock_partition_write failed: {:?}", e);
+        if let Err(e) = crate::partition::lock_nvme_boot_partitions(boot_services) {
+            log::error!("lock_nvme_boot_partitions failed: {:?}", e);
         }
 
         if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
@@ -159,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_new_constructs() {
-        let _ = SreBootManager::new(test_device_path(), test_device_path());
+        let _ = SreBootManager::new(test_device_path());
     }
 
     #[test]
@@ -216,6 +217,6 @@ mod tests {
     // matching the BootDispatcher consumption path.
     #[test]
     fn test_arc_dyn_construction() {
-        let _: Arc<dyn BootOrchestrator> = Arc::new(SreBootManager::new(test_device_path(), test_device_path()));
+        let _: Arc<dyn BootOrchestrator> = Arc::new(SreBootManager::new(test_device_path()));
     }
 }
