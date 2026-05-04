@@ -24,7 +24,7 @@ extern crate alloc;
 
 use patina::{
     boot_services::{BootServices, StandardBootServices},
-    component::service::dxe_dispatch::DxeDispatch,
+    component::service::{boot_storage::BootStorageService, dxe_dispatch::DxeDispatch},
     device_path::paths::DevicePathBuf,
     error::EfiError,
     runtime_services::StandardRuntimeServices,
@@ -56,16 +56,23 @@ fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
 /// Skeleton — normal boot path only. The SRE-entry hotkey, WIM-to-RAM-disk boot,
 /// and capsule-update pre-boot hook will land in subsequent issues and extend this
 /// orchestrator without changing the public constructor surface.
+///
+/// Boot-storage operations (e.g. write-protecting the boot partition before OS
+/// hand-off) are dispatched through the [`BootStorageService`] supplied via DI by
+/// the platform's component graph. If no storage service is registered, the lock
+/// step is skipped with a warning.
 pub struct SreBootManager {
-    boot_partition_path: DevicePathBuf,
     main_os_path: DevicePathBuf,
 }
 
 impl SreBootManager {
-    /// Construct an `SreBootManager` from the device paths of the boot partition
-    /// (to be write-locked before OS hand-off) and the main OS boot device.
-    pub fn new(boot_partition_path: DevicePathBuf, main_os_path: DevicePathBuf) -> Self {
-        Self { boot_partition_path, main_os_path }
+    /// Construct an `SreBootManager` from the device path of the main OS boot device.
+    ///
+    /// The boot-storage backend (e.g. NVMe BPWPS, EC, secure variable) is resolved at
+    /// runtime via the [`BootStorageService`] DI parameter — no constructor argument
+    /// is required for it.
+    pub fn new(main_os_path: DevicePathBuf) -> Self {
+        Self { main_os_path }
     }
 }
 
@@ -76,6 +83,7 @@ impl BootOrchestrator for SreBootManager {
         boot_services: &StandardBootServices,
         runtime_services: &StandardRuntimeServices,
         dxe_dispatch: &dyn DxeDispatch,
+        boot_storage: Option<&dyn BootStorageService>,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
         if let Err(e) = interleave_connect_and_dispatch(boot_services, dxe_dispatch) {
@@ -90,8 +98,15 @@ impl BootOrchestrator for SreBootManager {
             log::error!("discover_console_devices failed: {:?}", e);
         }
 
-        if let Err(e) = crate::partition::lock_partition_write(boot_services, &self.boot_partition_path) {
-            log::error!("lock_partition_write failed: {:?}", e);
+        match boot_storage {
+            Some(storage) => {
+                if let Err(e) = storage.lock_boot_partition() {
+                    log::error!("BootStorageService::lock_boot_partition failed: {:?}", e);
+                }
+            }
+            None => {
+                log::warn!("No BootStorageService registered; skipping boot-partition lock");
+            }
         }
 
         if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
@@ -159,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_new_constructs() {
-        let _ = SreBootManager::new(test_device_path(), test_device_path());
+        let _ = SreBootManager::new(test_device_path());
     }
 
     #[test]
@@ -216,6 +231,6 @@ mod tests {
     // matching the BootDispatcher consumption path.
     #[test]
     fn test_arc_dyn_construction() {
-        let _: Arc<dyn BootOrchestrator> = Arc::new(SreBootManager::new(test_device_path(), test_device_path()));
+        let _: Arc<dyn BootOrchestrator> = Arc::new(SreBootManager::new(test_device_path()));
     }
 }

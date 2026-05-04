@@ -20,7 +20,7 @@ use patina::{
     component::{
         component,
         params::Handle,
-        service::{Service, dxe_dispatch::DxeDispatch},
+        service::{Service, boot_storage::BootStorageService, dxe_dispatch::DxeDispatch},
     },
     error::{EfiError, Result},
     pi::protocols::bds,
@@ -34,6 +34,7 @@ use crate::boot_orchestrator::BootOrchestrator;
 struct BdsContext {
     orchestrator: Box<dyn BootOrchestrator>,
     dxe_dispatch: &'static dyn DxeDispatch,
+    boot_storage: Option<&'static dyn BootStorageService>,
     boot_services: StandardBootServices,
     runtime_services: StandardRuntimeServices,
     image_handle: r_efi::efi::Handle,
@@ -99,6 +100,7 @@ impl BootDispatcher {
         boot_services: StandardBootServices,
         runtime_services: StandardRuntimeServices,
         dxe_dispatch: Service<dyn DxeDispatch>,
+        boot_storage: Option<Service<dyn BootStorageService>>,
         image_handle: Option<Handle>,
     ) -> Result<()> {
         let handle = image_handle.ok_or_else(|| {
@@ -110,6 +112,7 @@ impl BootDispatcher {
         BDS_CONTEXT.call_once(|| BdsContext {
             orchestrator: self.orchestrator,
             dxe_dispatch: *dxe_dispatch,
+            boot_storage: boot_storage.map(|s| *s),
             boot_services: boot_services.clone(),
             runtime_services: runtime_services.clone(),
             image_handle: *handle,
@@ -148,6 +151,7 @@ extern "efiapi" fn bds_entry_point(_this: *mut bds::Protocol) {
         &context.boot_services,
         &context.runtime_services,
         context.dxe_dispatch,
+        context.boot_storage,
         context.image_handle,
     );
     panic!("BootOrchestrator::execute() failed: {e:?}");
@@ -157,7 +161,8 @@ extern "efiapi" fn bds_entry_point(_this: *mut bds::Protocol) {
 mod tests {
     use super::*;
     use patina::{
-        boot_services::StandardBootServices, component::service::dxe_dispatch::DxeDispatch,
+        boot_services::StandardBootServices,
+        component::service::{boot_storage::BootStorageService, dxe_dispatch::DxeDispatch},
         runtime_services::StandardRuntimeServices,
     };
     use r_efi::efi;
@@ -170,6 +175,7 @@ mod tests {
             _boot_services: &StandardBootServices,
             _runtime_services: &StandardRuntimeServices,
             _dxe_dispatch: &dyn DxeDispatch,
+            _boot_storage: Option<&dyn BootStorageService>,
             _image_handle: efi::Handle,
         ) -> core::result::Result<!, patina::error::EfiError> {
             Err(patina::error::EfiError::NotFound)

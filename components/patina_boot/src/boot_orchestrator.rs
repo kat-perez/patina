@@ -12,7 +12,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use patina::{
-    boot_services::StandardBootServices, component::service::dxe_dispatch::DxeDispatch, error::EfiError,
+    boot_services::StandardBootServices,
+    component::service::{boot_storage::BootStorageService, dxe_dispatch::DxeDispatch},
+    error::EfiError,
     runtime_services::StandardRuntimeServices,
 };
 use r_efi::efi;
@@ -70,6 +72,7 @@ pub trait BootOrchestrator: Send + Sync + 'static {
         boot_services: &StandardBootServices,
         runtime_services: &StandardRuntimeServices,
         dxe_services: &dyn DxeDispatch,
+        boot_storage: Option<&dyn BootStorageService>,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError>;
 }

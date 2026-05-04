@@ -23,7 +23,7 @@ use patina::{
 };
 use r_efi::efi;
 
-use patina::component::service::dxe_dispatch::DxeDispatch;
+use patina::component::service::{boot_storage::BootStorageService, dxe_dispatch::DxeDispatch};
 
 use patina::boot_services::BootServices;
 
@@ -111,6 +111,7 @@ impl BootOrchestrator for SimpleBootManager {
         boot_services: &StandardBootServices,
         runtime_services: &StandardRuntimeServices,
         dxe_dispatch: &dyn DxeDispatch,
+        _boot_storage: Option<&dyn BootStorageService>,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
         if let Err(e) = interleave_connect_and_dispatch(boot_services, dxe_dispatch) {
